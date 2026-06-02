@@ -304,6 +304,10 @@ def main():
     if not db_test_connection():
         print("❌ Přihlášení selhalo! Zkontroluj zadané údaje a síť.")
         return
+#Zadej IP adresu serveru: 192.168.135.10
+#Zadej uživatelské jméno: student
+#Zadej heslo:
+#Zadej název databáze: obce
 
     print("✅ Úspěšně ověřeno. Vítejte!")
 
