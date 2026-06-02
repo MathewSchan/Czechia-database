@@ -1,262 +1,333 @@
 import psycopg2
 import csv
+import getpass
 import matplotlib.pyplot as plt
 
+# Globální konfigurace pro databázi
+DB_CONFIG = {}
 
-# ---------------------------------------------------------
-# 1) Připojení k databázi
-# ---------------------------------------------------------
-def connect():
-    """Vytvoří a vrátí připojení do PostgreSQL databáze."""
+# Pomocný SQL řetězec pro odstranění české diakritiky přímo v PostgreSQL
+SQL_UNACCENT = "lower(translate({column}, 'áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ', 'acdeeinrstuuizACDEEINRSTUUIZ'))"
+
+
+# =====================================================================
+# 1. DATABÁZOVÁ VRSTVA (DB)
+# =====================================================================
+
+def db_test_connection():
     try:
-        conn = psycopg2.connect(
-            host="192.168.135.10",
-            database="obce",
-            user="student",
-            password="bluemonkey3"  # Doplň heslo, pokud ho vaše databáze vyžaduje
-        )
-        return conn
-    except Exception as e:
-        print(f"❌ Chyba při připojování k databázi: {e}")
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def db_fetch_all(query, params=None):
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def db_fetch_one(query, params=None):
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+# =====================================================================
+# 2. APLIKAČNÍ VRSTVA (APP)
+# =====================================================================
+
+def app_resolve_okres_id(vstup):
+    vstup = vstup.strip()
+    if not vstup:
         return None
 
+    vstup_upper = vstup.upper()
 
-# ---------------------------------------------------------
-# 2) Výpis okresů
-# ---------------------------------------------------------
-def vypis_okresu(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT id_okres, nazev FROM okresy ORDER BY id_okres;")
-        okresy = cur.fetchall()
-        print("\n--- Seznam okresů ---")
-        for id_okres, nazev in okresy:
-            print(f"{id_okres} {nazev}")
-
-
-# ---------------------------------------------------------
-# 3) Zobrazení obcí v okrese (SQL JOIN)
-# ---------------------------------------------------------
-def obce_v_okrese(conn):
-    id_okr = input("Zadej kód okresu (např. CZ0100): ").strip()
-
-    with conn.cursor() as cur:
-        # Použití JOIN ke zjištění názvu okresu i obcí zároveň
-        dotaz = """
-            SELECT o.nazev AS nazev_okresu, p.nazev, p.pocet_obyvatel, p.prumerny_vek
-            FROM obce_pob p
-            JOIN okresy o ON p.id_okres = o.id_okres
-            WHERE o.id_okres = %s
-            ORDER BY p.pocet_obyvatel DESC;
-        """
-        cur.execute(dotaz, (id_okr,))
-        obce = cur.fetchall()
-
-        if not obce:
-            print("❌ Okres nenalezen nebo v něm nejsou žádné obce.")
-            return
-
-        nazev_okresu = obce[0][0]
-        celkem_obci = len(obce)
-        celkem_obyv = sum(obec[2] for obec in obce if obec[2])
-
-        print(f"\n{nazev_okresu} — počet obcí: {celkem_obci}")
-        print(f"{nazev_okresu} — obyvatel: {celkem_obyv:,}".replace(',', ' '))
-        print("-" * 50)
-        print(f"{'Název obce':<30} | {'Obyvatel':<10} | {'Průměrný věk'}")
-        print("-" * 50)
-
-        for radek in obce:
-            print(f"{radek[1]:<30} | {radek[2]:<10} | {radek[3]}")
+    query = f"""
+        SELECT id_okres FROM okresy 
+        WHERE id_okres ILIKE %s 
+           OR {SQL_UNACCENT.format(column='nazev')} LIKE {SQL_UNACCENT.format(column='%s')}
+        LIMIT 1;
+    """
+    vysledek = db_fetch_one(query, (f"%{vstup_upper}%", f"%{vstup}%"))
+    return vysledek[0] if vysledek else None
 
 
-# ---------------------------------------------------------
-# 4) Vyhledání obce podle názvu (SQL LIKE)
-# ---------------------------------------------------------
-def hledani_obce(conn):
-    hledano = input("Zadej část názvu obce: ").strip()
-
-    with conn.cursor() as cur:
-        # ILIKE zajistí, že vyhledávání ignoruje velikost písmen (case-insensitive)
-        cur.execute("SELECT nazev FROM obce_pob WHERE nazev ILIKE %s ORDER BY nazev;", (f"%{hledano}%",))
-        vysledky = cur.fetchall()
-
-        print("\n--- Nalezené obce ---")
-        if vysledky:
-            for v in vysledky:
-                print(v[0])
-        else:
-            print("Žádná obec nebyla nalezena.")
+def app_get_okresy_list():
+    query = "SELECT id_okres, nazev FROM okresy ORDER BY id_okres;"
+    raw_data = db_fetch_all(query)
+    return [{"id": r[0], "nazev": r[1]} for r in raw_data]
 
 
-# ---------------------------------------------------------
-# 5) Statistika okresu (Agregační funkce + GROUP BY)
-# ---------------------------------------------------------
-def statistika_okresu(conn):
-    id_okr = input("Zadej kód okresu pro statistiku: ").strip()
+def app_get_obce_v_okrese(vstup_uzivatele):
+    id_okr = app_resolve_okres_id(vstup_uzivatele)
+    if not id_okr:
+        return None
 
-    with conn.cursor() as cur:
-        dotaz = """
-            SELECT o.nazev, 
-                   SUM(p.pocet_obyvatel), 
-                   AVG(p.prumerny_vek), 
-                   SUM(p.pocet_muzi), 
-                   SUM(p.pocet_zeny)
-            FROM obce_pob p
-            JOIN okresy o ON p.id_okres = o.id_okres
-            WHERE o.id_okres = %s
-            GROUP BY o.nazev;
-        """
-        cur.execute(dotaz, (id_okr,))
-        stat = cur.fetchone()
+    query = """
+        SELECT o.nazev, p.nazev, p.pocet_obyvatel, p.prumerny_vek
+        FROM obce_pob p JOIN okresy o ON p.id_okres = o.id_okres
+        WHERE o.id_okres = %s ORDER BY p.pocet_obyvatel DESC;
+    """
+    raw_data = db_fetch_all(query, (id_okr,))
+    if not raw_data:
+        return None
 
-        if stat:
-            nazev, celkem, prum_vek, muzi, zeny = stat
-            print(f"\n--- Statistika pro okres: {nazev} ---")
-            print(f"Celkový počet obyvatel: {celkem:,}".replace(',', ' '))
-            print(f"Průměrný věk:           {prum_vek:.2f} let")
-            print(f"Počet mužů:             {muzi:,}".replace(',', ' '))
-            print(f"Počet žen:              {zeny:,}".replace(',', ' '))
-            if zeny and zeny > 0:
-                print(f"Poměr mužů na 1 ženu:   {muzi / zeny:.2f}")
-        else:
-            print("❌ Okres nenalezen.")
+    return {
+        "okres_nazev": raw_data[0][0],
+        "obce": [{"nazev": r[1], "obyvatele": r[2], "vek": r[3]} for r in raw_data]
+    }
 
 
-# ---------------------------------------------------------
-# ⭐ Bonus 1: Export do CSV
-# ---------------------------------------------------------
-def export_do_csv(conn):
-    id_okr = input("Zadej kód okresu pro export: ").strip()
-
-    with conn.cursor() as cur:
-        dotaz = """
-            SELECT o.nazev, p.nazev, p.pocet_obyvatel, p.pocet_muzi, p.pocet_zeny, p.prumerny_vek
-            FROM obce_pob p
-            JOIN okresy o ON p.id_okres = o.id_okres
-            WHERE o.id_okres = %s
-            ORDER BY p.nazev;
-        """
-        cur.execute(dotaz, (id_okr,))
-        data = cur.fetchall()
-
-        if not data:
-            print("❌ Žádná data k exportu.")
-            return
-
-        nazev_okresu_soubor = data[0][0].lower().replace(" ", "_") + ".csv"
-
-        with open(nazev_okresu_soubor, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file, delimiter=';')
-            writer.writerow(["Okres", "Obec", "Pocet_obyvatel", "Muzi", "Zeny", "Prumerny_vek"])
-            writer.writerows(data)
-
-        print(f"✅ Data byla úspěšně exportována do souboru: {nazev_okresu_soubor}")
+def app_hledat_obec(nazev_cast):
+    # SQL dotaz upraven o JOIN na okresy a CASE podmínku porovnávající názvy
+    query = f"""
+        SELECT p.nazev, 
+               CASE WHEN p.nazev = o.nazev THEN 1 ELSE 0 END as shoda
+        FROM obce_pob p
+        JOIN okresy o ON p.id_okres = o.id_okres
+        WHERE {SQL_UNACCENT.format(column='p.nazev')} LIKE {SQL_UNACCENT.format(column='%s')}
+        ORDER BY p.nazev;
+    """
+    raw_data = db_fetch_all(query, (f"%{nazev_cast}%",))
+    return [{"nazev": r[0], "je_stejny_jako_okres": bool(r[1])} for r in raw_data]
 
 
-# ---------------------------------------------------------
-# ⭐ Bonus 2: Top 10 největších obcí
-# ---------------------------------------------------------
-def top_10_obci(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT nazev, pocet_obyvatel FROM obce_pob ORDER BY pocet_obyvatel DESC LIMIT 10;")
-        obce = cur.fetchall()
+def app_get_statistika(vstup_uzivatele):
+    id_okr = app_resolve_okres_id(vstup_uzivatele)
+    if not id_okr:
+        return None
 
-        print("\n--- TOP 10 největších obcí v ČR ---")
-        for i, obec in enumerate(obce, 1):
-            print(f"{i:2}. {obec[0]:<25} - {obec[1]:>8,} obyvatel".replace(',', ' '))
-
-
-# ---------------------------------------------------------
-# ⭐ Bonus 3: Graf (matplotlib)
-# ---------------------------------------------------------
-def zobrazit_graf(conn):
-    id_okr = input("Zadej kód okresu pro graf (muži vs. ženy): ").strip()
-
-    with conn.cursor() as cur:
-        dotaz = """
-            SELECT SUM(pocet_muzi), SUM(pocet_zeny), o.nazev
-            FROM obce_pob p
-            JOIN okresy o ON p.id_okres = o.id_okres
-            WHERE o.id_okres = %s
-            GROUP BY o.nazev;
-        """
-        cur.execute(dotaz, (id_okr,))
-        vysledek = cur.fetchone()
-
-        if not vysledek or not vysledek[0]:
-            print("❌ Okres nenalezen nebo chybí data pro graf.")
-            return
-
-        muzi, zeny, nazev_okresu = vysledek
-
-        # Vykreslení grafu
-        labels = ['Muži', 'Ženy']
-        values = [muzi, zeny]
-        colors = ['#3498db', '#e74c3c']
-
-        plt.figure(figsize=(6, 4))
-        plt.bar(labels, values, color=colors)
-        plt.title(f'Porovnání počtu mužů a žen - {nazev_okresu}')
-        plt.ylabel('Počet obyvatel')
-
-        # Zobrazení přesných hodnot nad sloupci
-        for i, v in enumerate(values):
-            plt.text(i, v + (max(values) * 0.01), str(v), ha='center', fontweight='bold')
-
-        plt.tight_layout()
-        plt.show()
+    query = """
+        SELECT o.nazev, SUM(p.pocet_obyvatel), AVG(p.prumerny_vek), SUM(p.pocet_muzi), SUM(p.pocet_zeny)
+        FROM obce_pob p JOIN okresy o ON p.id_okres = o.id_okres
+        WHERE o.id_okres = %s GROUP BY o.nazev;
+    """
+    raw = db_fetch_one(query, (id_okr,))
+    if not raw:
+        return None
+    return {
+        "nazev": raw[0], "celkem": int(raw[1]), "vek": round(float(raw[2]), 2),
+        "muzi": int(raw[3]), "zeny": int(raw[4])
+    }
 
 
-# ---------------------------------------------------------
-# HLAVNÍ MENU APLIKACE
-# ---------------------------------------------------------
-def menu():
-    print("\n" + "=" * 25)
-    print("DEMOGRAFIE ČR")
-    print("=" * 25)
-    print("1 - Seznam okresů")
-    print("2 - Obce v okrese")
-    print("3 - Hledat obec")
-    print("4 - Statistiky okresu")
-    print("5 - ⭐ Export do CSV (Bonus)")
-    print("6 - ⭐ Top 10 obcí (Bonus)")
-    print("7 - ⭐ Zobrazit graf (Bonus)")
-    print("0 - Konec")
+def app_get_top_10():
+    query = "SELECT nazev, pocet_obyvatel FROM obce_pob ORDER BY pocet_obyvatel DESC LIMIT 10;"
+    raw = db_fetch_all(query)
+    return [{"nazev": r[0], "obyvatele": r[1]} for r in raw]
 
-    volba = input("Vyber: ").strip()
-    return volba
 
+def app_export_csv_file(vstup_uzivatele):
+    id_okr = app_resolve_okres_id(vstup_uzivatele)
+    if not id_okr:
+        return None
+
+    query = """
+        SELECT o.nazev, p.nazev, p.pocet_obyvatel, p.pocet_muzi, p.pocet_zeny, p.prumerny_vek
+        FROM obce_pob p JOIN okresy o ON p.id_okres = o.id_okres WHERE o.id_okres = %s;
+    """
+    raw_data = db_fetch_all(query, (id_okr,))
+    if not raw_data:
+        return None
+
+    filename = raw_data[0][0].lower().replace(" ", "_") + ".csv"
+    with open(filename, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow(["Okres", "Obec", "Obyvatele", "Muzi", "Zeny", "Vek"])
+        writer.writerows(raw_data)
+    return filename
+
+
+# =====================================================================
+# 3. API VRSTVA
+# =====================================================================
+
+def api_get_okresy():
+    return {"status": 200, "data": app_get_okresy_list()}
+
+
+def api_get_obce(vstup_okres):
+    data = app_get_obce_v_okrese(vstup_okres)
+    return {"status": 200, "data": data} if data else {"status": 404,
+                                                       "error": "Okres nebyl podle vašeho zadání nalezen."}
+
+
+def api_hledat_obec(nazev):
+    return {"status": 200, "data": app_hledat_obec(nazev)}
+
+
+def api_get_statistika(vstup_okres):
+    data = app_get_statistika(vstup_okres)
+    return {"status": 200, "data": data} if data else {"status": 404,
+                                                       "error": "Okres nebyl podle vašeho zadání nalezen."}
+
+
+def api_get_top10():
+    return {"status": 200, "data": app_get_top_10()}
+
+
+def api_export_csv(vstup_okres):
+    filename = app_export_csv_file(vstup_okres)
+    return {"status": 200, "filename": filename} if filename else {"status": 404,
+                                                                   "error": "Export selhal, okres nenalezen."}
+
+
+# =====================================================================
+# 4. UŽIVATELSKÉ ROZHRANÍ (UI)
+# =====================================================================
+
+def ui_vypis_okresu():
+    response = api_get_okresy()
+    print("\n--- Seznam okresů ---")
+    for okr in response["data"]:
+        print(f"{okr['id']} {okr['nazev']}")
+
+
+def ui_obce_v_okrese():
+    vstup = input("Zadej okres (název, kód nebo číslo): ")
+    response = api_get_obce(vstup)
+
+    if response["status"] != 200:
+        print(f"❌ {response['error']}")
+        return
+
+    data = response["data"]
+    celkem_obyv = sum(o["obyvatele"] for o in data["obce"])
+
+    print(f"\n{data['okres_nazev']} — počet obcí: {len(data['obce'])}")
+    print(f"{data['okres_nazev']} — obyvatel: {celkem_obyv:,}".replace(',', ' '))
+    print("-" * 55)
+    print(f"{'Název obce':<30} | {'Obyvatel':<10} | {'Průměrný věk'}")
+    print("-" * 55)
+    for o in data["obce"]:
+        print(f"{o['nazev']:<30} | {o['obyvatele']:<10} | {o['vek']}")
+
+
+def ui_hledat_obec():
+    text = input("Zadej název obce (stačí část, bez diakritiky): ")
+    response = api_hledat_obec(text)
+    print("\n--- Nalezené obce (* = obec se jmenuje stejně jako její okres) ---")
+    if response["data"]:
+        for obec in response["data"]:
+            # Pokud se název obce shoduje s názvem okresu, přidáme hvězdičku
+            oznaceni = " *" if obec["je_stejny_jako_okres"] else ""
+            print(f"{obec['nazev']}{oznaceni}")
+    else:
+        print("Žádná obec nebyla nalezena.")
+
+
+def ui_statistika_okresu():
+    vstup = input("Zadej okres pro statistiku (kód nebo název): ")
+    response = api_get_statistika(vstup)
+
+    if response["status"] != 200:
+        print(f"❌ {response['error']}")
+        return
+
+    d = response["data"]
+    pomer = d["muzi"] / d["zeny"] if d["zeny"] > 0 else 0
+    print(f"\n--- Statistika pro okres: {d['nazev']} ---")
+    print(f"Celkový počet obyvatel: {d['celkem']:,}".replace(',', ' '))
+    print(f"Průměrný věk:           {d['vek']} let")
+    print(f"Počet mužů / žen:       {d['muzi']:,} / {d['zeny']:,}".replace(',', ' '))
+    print(f"Poměr mužů na 1 ženu:   {pomer:.2f}")
+
+
+def ui_export_csv():
+    vstup = input("Zadej okres pro export do CSV: ")
+    response = api_export_csv(vstup)
+    if response["status"] == 200:
+        print(f"✅ Soubor '{response['filename']}' byl úspěšně vygenerován.")
+    else:
+        print(f"❌ {response['error']}")
+
+
+def ui_top_10():
+    response = api_get_top10()
+    print("\n--- TOP 10 největších obcí v ČR ---")
+    for i, o in enumerate(response["data"], 1):
+        print(f"{i:2}. {o['nazev']:<25} - {o['obyvatele']:>8,} obyvatel".replace(',', ' '))
+
+
+def ui_zobraz_graf():
+    vstup = input("Zadej okres pro zobrazení grafu pohlaví: ")
+    response = api_get_statistika(vstup)
+
+    if response["status"] != 200:
+        print(f"❌ {response['error']}")
+        return
+
+    d = response["data"]
+    plt.figure(figsize=(5, 4))
+    plt.bar(['Muži', 'Ženy'], [d['muzi'], d['zeny']], color=['#3498db', '#e74c3c'])
+    plt.title(f"Poměr pohlaví - {d['nazev']}")
+    plt.ylabel('Počet obyvatel')
+    plt.tight_layout()
+    plt.show()
+
+
+def ui_menu():
+    print("\n=========================\nDEMOGRAFIE ČR\n=========================")
+    print("1 - Seznam okresů\n2 - Obce v okrese\n3 - Hledat obec\n4 - Statistiky okresu")
+    print("5 - ⭐ Export do CSV\n6 - ⭐ Top 10 obcí\n7 - ⭐ Zobrazit graf\n0 - Konec")
+    return input("Vyber: ").strip()
+
+
+# =====================================================================
+# VSTUPNÍ BOD PROGRAMU
+# =====================================================================
 
 def main():
-    conn = connect()
-    if not conn:
-        return  # Pokud se nepřipojíme, program skončí
+    print("=== JEDNORÁZOVÉ PŘIHLÁŠENÍ K DATABÁZI ===")
+    global DB_CONFIG
+    DB_CONFIG['host'] = input("Zadej IP adresu serveru: ").strip()
+    DB_CONFIG['user'] = input("Zadej uživatelské jméno: ").strip()
+
+    # Poznámka: Pokud tvé IDE nepodporuje getpass, znaky se mohou zobrazovat.
+    # Pro 100% skrytí spusť skript přímo přes systémový Terminál / Příkazovou řádku.
+    DB_CONFIG['password'] = getpass.getpass("Zadej heslo: ").strip()
+    DB_CONFIG['database'] = input("Zadej název databáze: ").strip()
+
+    print("\n🔄 Připojování k PostgreSQL...")
+    if not db_test_connection():
+        print("❌ Přihlášení selhalo! Zkontroluj zadané údaje a síť.")
+        return
+
+    print("✅ Úspěšně ověřeno. Vítejte!")
 
     while True:
-        volba = menu()
-
+        volba = ui_menu()
         if volba == '1':
-            vypis_okresu(conn)
+            ui_vypis_okresu()
         elif volba == '2':
-            obce_v_okrese(conn)
+            ui_obce_v_okrese()
         elif volba == '3':
-            hledani_obce(conn)
+            ui_hledat_obec()
         elif volba == '4':
-            statistika_okresu(conn)
+            ui_statistika_okresu()
         elif volba == '5':
-            export_do_csv(conn)
+            ui_export_csv()
         elif volba == '6':
-            top_10_obci(conn)
+            ui_top_10()
         elif volba == '7':
-            zobrazit_graf(conn)
+            ui_zobraz_graf()
         elif volba == '0':
-            print("Ukončuji aplikaci. Měj se!")
+            print("Nashledanou!")
             break
         else:
-            print("❌ Neplatná volba, zkus to znovu.")
-
-    # Úklid a uzavření spojení po konci while smyčky
-    conn.close()
+            print("Neplatná volba, zkuste to znovu.")
 
 
 if __name__ == "__main__":
